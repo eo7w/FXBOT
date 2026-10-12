@@ -12,9 +12,9 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
 
 import requests
+from technical_analysis import format_analysis
 
 try:
     from dotenv import load_dotenv
@@ -318,6 +318,7 @@ class SignalBot:
         self.last_candle_refresh = 0.0
         self.m1: list[Bar] = []
         self.m5: list[Bar] = []
+        self.m15: list[Bar] = []
         self.last_data_warning = 0.0
 
     def _price(self, value: float) -> str:
@@ -335,8 +336,10 @@ class SignalBot:
                 self.telegram.send("▶️ عادت مراقبة الإشارات الجديدة.")
             elif command == "/status":
                 self._send_status()
+            elif command == "/analysis":
+                self._send_analysis()
             elif command in ("/help", "/start"):
-                self.telegram.send("الأوامر: /status للحالة، /pause لإيقاف الإشارات الجديدة، /resume لاستئنافها. متابعة الصفقة المفتوحة لا تتوقف عند /pause.")
+                self.telegram.send("الأوامر: /analysis للتحليل الفني، /status للحالة، /pause لإيقاف الإشارات الجديدة، /resume لاستئنافها. متابعة الصفقة المفتوحة لا تتوقف عند /pause.")
 
     def _send_status(self) -> None:
         self.state.roll_day()
@@ -348,11 +351,32 @@ class SignalBot:
             text += f"\nصفقة متابعة مفتوحة: {side} من {self._price(float(active['entry']))} | هدف {self._price(float(active['target']))} | وقف {self._price(float(active['stop']))}"
         self.telegram.send(text)
 
-    def _update_candles(self, now: float) -> None:
-        if now - self.last_candle_refresh < self.config.candle_refresh_seconds:
+    def _send_analysis(self) -> None:
+        try:
+            quote = self.market.quote()
+            self._update_candles(time.monotonic(), force=True)
+            setup = _bullish_setup(self.m1, self.m5, self.config.min_atr)
+            report = format_analysis(
+                self.config.symbol, quote, self.m1, self.m5, self.m15, setup,
+                self.config.max_spread, self.config.max_quote_age_seconds, self._price,
+            )
+            self.telegram.send(report)
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            self.telegram.send("تعذر جلب بيانات كافية للتحليل الآن؛ سأحاول مجددًا في الدورة القادمة.")
+
+    def _format_analysis(self, quote: dict[str, Any], compact: bool = False) -> str:
+        setup = _bullish_setup(self.m1, self.m5, self.config.min_atr)
+        return format_analysis(
+            self.config.symbol, quote, self.m1, self.m5, self.m15, setup,
+            self.config.max_spread, self.config.max_quote_age_seconds, self._price, compact,
+        )
+
+    def _update_candles(self, now: float, force: bool = False) -> None:
+        if not force and now - self.last_candle_refresh < self.config.candle_refresh_seconds:
             return
         self.m1 = self.market.candles("1m", 250)
         self.m5 = self.market.candles("5m", 250)
+        self.m15 = self.market.candles("15m", 250)
         self.last_candle_refresh = now
 
     def _quote_is_fresh(self, quote: dict[str, Any]) -> bool:
@@ -441,7 +465,8 @@ class SignalBot:
             f"وقف الخسارة: <code>{self._price(stop)}</code>\n"
             f"نسبة العائد/المخاطرة النظرية: 1:{rr:.2f}\n"
             f"سبب الإشارة: {escape(reason)}\n"
-            f"الإطار: 1 دقيقة مع تأكيد اتجاه 5 دقائق | السبريد: {self._price(spread)}\n"
+            f"الإطار: 1m مع تأكيد 5m وسياق 15m | السبريد: {self._price(spread)}\n"
+            f"{escape(self._format_analysis(quote, compact=True))}\n"
             f"وقت الإشارة: {opened}\n"
             "لا تُنفَّذ أي صفقة تلقائيًا؛ السعر الفعلي لدى وسيطك قد يختلف."
         )
@@ -464,9 +489,9 @@ class SignalBot:
         logging.info("Starting signal monitor for %s", self.config.symbol)
         self.telegram.send(
             f"✅ <b>بدأ مراقب {escape(self.config.symbol)}</b>\n"
-            f"بيانات: BiQuote | الإطارات: 1m + 5m\n"
+            f"بيانات: BiQuote | الإطارات: 1m + 5m + 15m\n"
             f"الحد الأقصى للإشارات: {self.config.max_daily_trades}/اليوم (UTC)\n"
-            "إشارات ومتابعة فقط؛ لا ينفذ أوامر لدى وسيط. استخدم /status و/pause و/resume."
+            "إشارات ومتابعة فقط؛ لا ينفذ أوامر لدى وسيط. استخدم /analysis للتحليل الفني أو /status و/pause و/resume."
         )
         while True:
             started = time.monotonic()
