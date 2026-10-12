@@ -8,16 +8,12 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
-import requests
 from flask import Flask, jsonify, send_from_directory
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
-_quote_lock = Lock()
-_quote_cache: dict[str, Any] = {"fetched_at": 0.0, "quote": None}
 
 
 def _int_env(name: str, default: int, minimum: int = 1) -> int:
@@ -42,44 +38,6 @@ def _iso_time(epoch: float | None) -> str | None:
         return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     except (OverflowError, OSError, ValueError):
         return None
-
-
-def get_market_quote() -> dict[str, Any] | None:
-    """Fetch and briefly cache public market data; never uses Telegram credentials."""
-    now = time.monotonic()
-    cache_ttl = _int_env("WEB_QUOTE_CACHE_SECONDS", 5)
-    with _quote_lock:
-        if now - float(_quote_cache["fetched_at"]) < cache_ttl:
-            return _quote_cache["quote"]
-        quote: dict[str, Any] | None = None
-        try:
-            base_url = os.getenv("BIQUOTE_BASE_URL", "https://biquote.io/api").rstrip("/")
-            symbol = os.getenv("BIQUOTE_SYMBOL", "XAUUSD").strip().upper() or "XAUUSD"
-            response = requests.get(
-                f"{base_url}/{symbol}",
-                params={"allowStale": "false"},
-                headers={"User-Agent": "FXBOT-Web-Dashboard/1.0"},
-                timeout=(3, 5),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if isinstance(payload, dict):
-                bid, ask = _number(payload.get("bid")), _number(payload.get("ask"))
-                if bid is not None and ask is not None and bid > 0 and ask >= bid:
-                    quote = {
-                        "symbol": symbol,
-                        "bid": bid,
-                        "ask": ask,
-                        "spread": _number(payload.get("spread")) or ask - bid,
-                        "market_state": str(payload.get("marketState", "unknown")),
-                        "stale": bool(payload.get("stale", False)),
-                        "quote_age_seconds": _number(payload.get("quoteAgeSeconds")),
-                    }
-        except (requests.RequestException, ValueError, TypeError):
-            quote = None
-        _quote_cache["fetched_at"] = time.monotonic()
-        _quote_cache["quote"] = quote
-        return quote
 
 
 def _load_bot_state() -> tuple[dict[str, Any], bool]:
@@ -148,33 +106,7 @@ def create_app() -> Flask:
         else:
             bot_status = "active"
 
-        quote = get_market_quote()
         symbol = os.getenv("BIQUOTE_SYMBOL", "XAUUSD").strip().upper() or "XAUUSD"
-        if quote:
-            market = {
-                "available": True,
-                "symbol": quote["symbol"],
-                "bid": quote["bid"],
-                "ask": quote["ask"],
-                "spread": quote["spread"],
-                "market_state": quote["market_state"],
-                "stale": quote["stale"],
-                "quote_age_seconds": quote["quote_age_seconds"],
-                "updated_at": _iso_time(time.time()),
-            }
-        else:
-            market = {
-                "available": False,
-                "symbol": symbol,
-                "bid": None,
-                "ask": None,
-                "spread": None,
-                "market_state": "unknown",
-                "stale": True,
-                "quote_age_seconds": None,
-                "updated_at": None,
-            }
-
         try:
             trades_today = max(0, int(state.get("trades_today", 0)))
         except (TypeError, ValueError):
@@ -182,6 +114,7 @@ def create_app() -> Flask:
         max_daily_trades = _int_env("MAX_DAILY_TRADES", 30)
         return jsonify({
             "generated_at": _iso_time(now),
+            "symbol": symbol,
             "bot": {
                 "status": bot_status,
                 "state_available": state_available,
@@ -193,7 +126,6 @@ def create_app() -> Flask:
                 "last_heartbeat": _iso_time(heartbeat),
                 "active_trade": _active_trade(state),
             },
-            "market": market,
             "disclaimer": "بيانات متابعة مرجعية فقط؛ لا ينفذ الموقع أوامر لدى وسيط ولا يضمن الربح.",
         })
 

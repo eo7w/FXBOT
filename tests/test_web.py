@@ -34,26 +34,22 @@ class DashboardApiTests(unittest.TestCase):
                 "trades_today": 2,
                 "active_trade": {"side": "BUY", "entry": 2300.1, "target": 2301.0, "stop": 2299.2, "opened_at": "2026-10-12T09:00:00+00:00"},
             }, handle)
-        with patch("web.get_market_quote", return_value={
-            "symbol": "XAUUSD", "bid": 2300.0, "ask": 2300.2, "spread": 0.2,
-            "market_state": "open", "stale": False, "quote_age_seconds": 1.0,
-        }):
-            response = self.client.get("/api/status")
+        response = self.client.get("/api/status")
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
+        self.assertEqual(payload["symbol"], "XAUUSD")
         self.assertEqual(payload["bot"]["status"], "active")
         self.assertEqual(payload["bot"]["trades_today"], 2)
         self.assertEqual(payload["bot"]["active_trade"]["side"], "BUY")
-        self.assertEqual(payload["market"]["ask"], 2300.2)
+        self.assertNotIn("market", payload)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     def test_status_reports_missing_state_without_failing(self):
-        with patch("web.get_market_quote", return_value=None):
-            response = self.client.get("/api/status")
+        response = self.client.get("/api/status")
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["bot"]["status"], "missing")
-        self.assertFalse(payload["market"]["available"])
+        self.assertNotIn("market", payload)
 
     def test_dashboard_page_is_served_without_a_password(self):
         response = self.client.get("/")

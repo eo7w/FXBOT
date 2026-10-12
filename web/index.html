@@ -144,7 +144,7 @@
           <span class="symbol" id="symbol">XAUUSD</span>
         </div>
         <div class="main-price" id="main-price">—</div>
-        <div class="price-caption" id="market-caption">دولار أمريكي للأونصة · بيانات السوق</div>
+        <div class="price-caption" id="market-caption">بانتظار أول تحديث مباشر · دولار أمريكي للأونصة</div>
         <div class="quote-grid">
           <div class="quote-mini"><span>شراء (Ask)</span><strong id="ask">—</strong></div>
           <div class="quote-mini"><span>بيع (Bid)</span><strong id="bid">—</strong></div>
@@ -173,9 +173,9 @@
         <div class="hint">الفرق بين سعر الشراء والبيع</div>
       </article>
       <article class="card stat">
-        <div class="eyebrow">حالة السوق</div>
+        <div class="eyebrow">حالة بث السعر</div>
         <div class="value" id="market-state">—</div>
-        <div class="hint" id="quote-age">عمر السعر: —</div>
+        <div class="hint" id="quote-age">بانتظار أول تحديث للسعر</div>
       </article>
       <article class="card stat">
         <div class="eyebrow">آخر نبضة للبوت</div>
@@ -198,9 +198,14 @@
     </section>
 
     <aside class="notice"><b>تنويه مهم</b><span>هذه لوحة متابعة وإشارات مرجعية فقط. لا تنفذ صفقات لدى وسيط، ولا تمثل نصيحة مالية أو ضمانًا للربح. قد تختلف الأسعار الفعلية بسبب السبريد والعمولة والانزلاق.</span></aside>
-    <footer><span class="refresh loading" id="refresh-state">جارٍ تحميل البيانات…</span><span id="updated-at">—</span></footer>
+    <footer>
+      <span class="refresh loading" id="market-stream-status">جارٍ الاتصال ببث السعر…</span>
+      <span class="refresh loading" id="refresh-state">جارٍ تحميل حالة البوت…</span>
+      <span id="updated-at">—</span>
+    </footer>
   </main>
 
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/8.0.0/signalr.min.js"></script>
   <script>
     const el = (id) => document.getElementById(id);
     const numberFormat = new Intl.NumberFormat('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
@@ -231,27 +236,113 @@
       el('trade-progress').parentElement.setAttribute('aria-valuenow', String(trades));
       el('heartbeat').textContent = bot?.last_heartbeat ? ageLabel(bot.heartbeat_age_seconds) : '—';
     }
-    function setMarket(market) {
-      el('symbol').textContent = market?.symbol || 'XAUUSD';
-      if (!market?.available) {
-        el('main-price').textContent = '—';
-        el('ask').textContent = '—';
-        el('bid').textContent = '—';
-        el('spread').textContent = '—';
-        el('market-state').textContent = 'غير متاح';
-        el('quote-age').textContent = 'تعذر جلب السعر حاليًا';
-        el('market-caption').textContent = 'يتعذر الوصول إلى بيانات السوق';
+    let activeSymbol = 'XAUUSD';
+    let tickConnection = null;
+    let tickRetryTimer = null;
+    let lastTickAt = null;
+    function setStreamStatus(text, loading = false) {
+      const status = el('market-stream-status');
+      status.textContent = text;
+      status.classList.toggle('loading', loading);
+    }
+    function scheduleTickRetry(callback) {
+      if (tickRetryTimer) return;
+      tickRetryTimer = window.setTimeout(() => {
+        tickRetryTimer = null;
+        callback();
+      }, 5000);
+    }
+    function setLiveTick(tick) {
+      if (!tick || typeof tick !== 'object') return;
+      const symbol = String(tick.symbol || '').toUpperCase();
+      if (symbol && symbol !== activeSymbol) return;
+      const bid = Number(tick.bid);
+      const ask = Number(tick.ask);
+      if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask < bid) return;
+      const rawMid = Number(tick.mid);
+      const mid = Number.isFinite(rawMid) && rawMid > 0 ? rawMid : (bid + ask) / 2;
+      const rawSpread = Number(tick.spread);
+      const spread = Number.isFinite(rawSpread) && rawSpread >= 0 ? rawSpread : ask - bid;
+      el('symbol').textContent = symbol || activeSymbol;
+      el('main-price').textContent = fmt(mid);
+      el('ask').textContent = fmt(ask);
+      el('bid').textContent = fmt(bid);
+      el('spread').textContent = fmt(spread);
+      el('market-state').textContent = 'مباشر';
+      el('market-caption').textContent = 'بث لحظي من BiQuote · دولار أمريكي للأونصة';
+      const sourceTime = tick.timestamp ? new Date(tick.timestamp).getTime() : Date.now();
+      lastTickAt = Number.isFinite(sourceTime) ? sourceTime : Date.now();
+      updateTickAge();
+    }
+    function updateTickAge() {
+      if (!lastTickAt) {
+        el('quote-age').textContent = 'بانتظار أول تحديث للسعر';
         return;
       }
-      const midpoint = (market.bid + market.ask) / 2;
-      el('main-price').textContent = fmt(midpoint);
-      el('ask').textContent = fmt(market.ask);
-      el('bid').textContent = fmt(market.bid);
-      el('spread').textContent = fmt(market.spread);
-      const state = market.market_state === 'open' ? 'مفتوح' : market.market_state === 'closed' ? 'مغلق' : 'غير معروف';
-      el('market-state').textContent = state;
-      el('quote-age').textContent = `عمر السعر: ${market.quote_age_seconds == null ? 'غير متاح' : ageLabel(market.quote_age_seconds)}`;
-      el('market-caption').textContent = market.stale ? 'آخر سعر مستلم قديم — تحقق من المصدر' : 'دولار أمريكي للأونصة · بيانات السوق';
+      const age = Math.max(0, (Date.now() - lastTickAt) / 1000);
+      el('quote-age').textContent = `آخر تحديث: ${ageLabel(age)}`;
+      if (age > 60) {
+        el('market-state').textContent = 'لا تصل تحديثات';
+        el('market-caption').textContent = 'قد يكون السوق هادئًا أو البث متوقفًا مؤقتًا';
+      } else {
+        el('market-state').textContent = 'مباشر';
+        el('market-caption').textContent = 'بث لحظي من BiQuote · دولار أمريكي للأونصة';
+      }
+    }
+    function startTickStream(symbol) {
+      const nextSymbol = String(symbol || 'XAUUSD').trim().toUpperCase();
+      if (!nextSymbol) return;
+      if (activeSymbol === nextSymbol && (tickConnection || tickRetryTimer)) return;
+      activeSymbol = nextSymbol;
+      if (tickRetryTimer) {
+        window.clearTimeout(tickRetryTimer);
+        tickRetryTimer = null;
+      }
+      const previous = tickConnection;
+      tickConnection = null;
+      if (previous) previous.stop().catch(() => {});
+      if (!window.signalR?.HubConnectionBuilder) {
+        setStreamStatus('تعذر تحميل مكتبة البث؛ إعادة المحاولة…', true);
+        scheduleTickRetry(() => startTickStream(activeSymbol));
+        return;
+      }
+      const connection = new signalR.HubConnectionBuilder()
+        .withUrl('https://biquote.io/hubs/tick')
+        .withAutomaticReconnect([0, 2000, 5000, 10000, 30000])
+        .configureLogging(signalR.LogLevel.Warning)
+        .build();
+      tickConnection = connection;
+      const subscribe = async () => {
+        if (tickConnection !== connection) return;
+        try {
+          await connection.invoke('Subscribe', [activeSymbol]);
+          setStreamStatus(`السعر مباشر · ${activeSymbol}`);
+        } catch (_) {
+          setStreamStatus('تعذّر الاشتراك؛ إعادة المحاولة…', true);
+          scheduleTickRetry(subscribe);
+        }
+      };
+      const connect = async () => {
+        if (tickConnection !== connection || connection.state !== signalR.HubConnectionState.Disconnected) return;
+        try {
+          setStreamStatus('جارٍ الاتصال ببث السعر…', true);
+          await connection.start();
+          await subscribe();
+        } catch (_) {
+          setStreamStatus('انقطع الاتصال؛ إعادة المحاولة…', true);
+          scheduleTickRetry(connect);
+        }
+      };
+      connection.on('ReceiveTick', setLiveTick);
+      connection.onreconnecting(() => setStreamStatus('انقطع البث؛ جارٍ إعادة الاتصال…', true));
+      connection.onreconnected(() => subscribe());
+      connection.onclose(() => {
+        if (tickConnection !== connection) return;
+        tickConnection = null;
+        setStreamStatus('انقطع البث؛ إعادة الاتصال…', true);
+        scheduleTickRetry(() => startTickStream(activeSymbol));
+      });
+      connect();
     }
     function setTrade(trade) {
       const empty = el('trade-empty');
@@ -279,20 +370,20 @@
         if (!response.ok) throw new Error('status');
         const data = await response.json();
         setBotStatus(data.bot);
-        setMarket(data.market);
         setTrade(data.bot?.active_trade);
-        indicator.textContent = 'تتحدث البيانات تلقائيًا كل 10 ثوانٍ';
-        el('updated-at').textContent = `آخر تحديث: ${formatTime(data.generated_at)}`;
+        indicator.textContent = 'حالة البوت تتحدث كل 10 ثوانٍ';
+        el('updated-at').textContent = `آخر تحديث للحالة: ${formatTime(data.generated_at)}`;
+        if (data.symbol && String(data.symbol).toUpperCase() !== activeSymbol) startTickStream(data.symbol);
       } catch (_) {
-        indicator.textContent = 'تعذر تحديث البيانات؛ ستتم إعادة المحاولة';
-        el('bot-connection').textContent = 'تعذر الاتصال بالخادم';
-        el('bot-dot').className = 'dot red';
+        indicator.textContent = 'تعذر تحديث حالة البوت؛ ستتم إعادة المحاولة';
       } finally {
         indicator.classList.remove('loading');
       }
     }
+    startTickStream(activeSymbol);
     loadStatus();
     window.setInterval(loadStatus, 10000);
+    window.setInterval(updateTickAge, 1000);
   </script>
 </body>
 </html>
