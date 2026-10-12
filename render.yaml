@@ -1,0 +1,30 @@
+services:
+  - type: worker
+    name: xauusd-telegram-signals
+    runtime: python
+    plan: 0.5c-512mb
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        value: "8952278702"
+      - key: BIQUOTE_BASE_URL
+        value: https://biquote.io/api
+      - key: BIQUOTE_SYMBOL
+        value: XAUUSD
+      - key: MAX_DAILY_TRADES
+        value: "30"
+      - key: MAX_SPREAD
+        value: "0.50"
+      - key: MIN_ATR
+        value: "0.30"
+      - key: MAX_HOLD_MINUTES
+        value: "20"
+      - key: LOOP_SECONDS
+        value: "5"
+      - key: CANDLE_REFRESH_SECONDS
+        value: "20"
+      - key: STATE_FILE
+        value: state.json
