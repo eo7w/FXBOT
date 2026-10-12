@@ -1,15 +1,18 @@
 """Read-only dashboard server for the XAUUSD Telegram signal bot."""
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import math
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
 from flask import Flask, jsonify, send_from_directory
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +41,117 @@ def _iso_time(epoch: float | None) -> str | None:
         return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def _quote_cache_paths() -> tuple[Path, Path]:
+    cache_file = Path(os.getenv("BIQUOTE_CACHE_FILE", "/tmp/fxbot-biquote-cache.json"))
+    lock_file = Path(os.getenv("BIQUOTE_CACHE_LOCK_FILE", "/tmp/fxbot-biquote-cache.lock"))
+    if not cache_file.is_absolute():
+        cache_file = Path.cwd() / cache_file
+    if not lock_file.is_absolute():
+        lock_file = Path.cwd() / lock_file
+    return cache_file, lock_file
+
+
+def _read_quote_cache(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _write_quote_cache(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix="fxbot-quote-", suffix=".json", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, separators=(",", ":"))
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
+def _retry_after_seconds(headers: Any) -> int:
+    try:
+        return min(60, max(1, int(headers.get("Retry-After", "1"))))
+    except (AttributeError, TypeError, ValueError):
+        return 1
+
+
+def _fetch_market_quote() -> tuple[dict[str, Any] | None, int]:
+    base_url = os.getenv("BIQUOTE_BASE_URL", "https://biquote.io/api").rstrip("/")
+    symbol = os.getenv("BIQUOTE_SYMBOL", "XAUUSD").strip().upper() or "XAUUSD"
+    try:
+        response = requests.get(
+            f"{base_url}/{symbol}",
+            headers={"User-Agent": "FXBOT-Web-Dashboard/1.0"},
+            timeout=(3, 5),
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.HTTPError as exc:
+        return None, _retry_after_seconds(getattr(exc.response, "headers", {}))
+    except (requests.RequestException, ValueError, TypeError):
+        return None, 1
+
+    if not isinstance(payload, dict):
+        return None, 1
+    bid, ask = _number(payload.get("bid")), _number(payload.get("ask"))
+    if bid is None or ask is None or bid <= 0 or ask < bid:
+        return None, 1
+
+    midpoint = _number(payload.get("mid"))
+    spread = _number(payload.get("spread"))
+    return {
+        "available": True,
+        "symbol": symbol,
+        "bid": bid,
+        "ask": ask,
+        "mid": midpoint if midpoint is not None and midpoint > 0 else (bid + ask) / 2,
+        "spread": spread if spread is not None and spread >= 0 else ask - bid,
+        "market_state": str(payload.get("marketState", "unknown")).lower(),
+        "stale": bool(payload.get("stale", False)),
+        "quote_age_seconds": _number(payload.get("quoteAgeSeconds")),
+        "timestamp": str(payload.get("timestamp", "")),
+    }, 1
+
+
+def get_market_quote() -> tuple[dict[str, Any] | None, int]:
+    """Fetch a public quote, coalescing concurrent viewers across web workers."""
+    cache_seconds = _int_env("WEB_QUOTE_CACHE_SECONDS", 1)
+    cache_path, lock_path = _quote_cache_paths()
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            now = time.monotonic()
+            snapshot = _read_quote_cache(cache_path)
+            if snapshot is not None:
+                fetched_at = _number(snapshot.get("fetched_at"))
+                ttl = _number(snapshot.get("cache_ttl_seconds")) or cache_seconds
+                if fetched_at is not None and max(0.0, now - fetched_at) < ttl:
+                    cached_quote = snapshot.get("quote")
+                    quote = cached_quote if isinstance(cached_quote, dict) else None
+                    cached_retry = _number(snapshot.get("retry_after")) or 1
+                    retry_after = min(60, max(1, int(cached_retry)))
+                    return quote, min(60, retry_after)
+
+            quote, retry_after = _fetch_market_quote()
+            cache_ttl = cache_seconds if quote is not None else max(cache_seconds, retry_after)
+            _write_quote_cache(cache_path, {
+                "fetched_at": time.monotonic(),
+                "cache_ttl_seconds": cache_ttl,
+                "retry_after": retry_after,
+                "quote": quote,
+            })
+            return quote, retry_after
+    except OSError as exc:
+        logging.warning("تعذر استخدام ذاكرة سعر السوق المشتركة (%s).", type(exc).__name__)
+        return None, 1
 
 
 def _load_bot_state() -> tuple[dict[str, Any], bool]:
@@ -86,6 +200,20 @@ def create_app() -> Flask:
     @app.get("/healthz")
     def health():
         return jsonify(ok=True)
+
+    @app.get("/api/price")
+    def price():
+        quote, retry_after = get_market_quote()
+        if quote is None:
+            response = jsonify({
+                "available": False,
+                "symbol": os.getenv("BIQUOTE_SYMBOL", "XAUUSD").strip().upper() or "XAUUSD",
+                "error": "quote_unavailable",
+            })
+            response.status_code = 503
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+        return jsonify(quote)
 
     @app.get("/api/status")
     def status():
