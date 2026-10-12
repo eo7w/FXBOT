@@ -1,6 +1,10 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from bot import Bar, atr, ema, parse_bars, rsi
+from bot import Bar, Config, atr, ema, parse_bars, rsi
 
 
 class IndicatorsTests(unittest.TestCase):
@@ -29,6 +33,20 @@ class IndicatorsTests(unittest.TestCase):
         bars = parse_bars(payload)
         self.assertEqual(len(bars), 2)
         self.assertEqual([bar.time for bar in bars], ["2026-01-01T00:01:00Z", "2026-01-01T00:02:00Z"])
+
+
+class ConfigSecretFileTests(unittest.TestCase):
+    def test_reads_token_from_external_file_when_environment_token_is_blank(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "telegram-token.txt"
+            token_file.write_text("test-only-token\n", encoding="utf-8")
+            with patch.dict(os.environ, {
+                "BOT_TOKEN": "",
+                "BOT_TOKEN_FILE": str(token_file),
+                "CHAT_ID": "12345",
+            }):
+                config = Config.from_env()
+        self.assertEqual(config.bot_token, "test-only-token")
 
 
 if __name__ == "__main__":

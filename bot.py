@@ -43,9 +43,15 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         token = os.getenv("BOT_TOKEN", "").strip()
+        token_file = os.getenv("BOT_TOKEN_FILE", "").strip()
+        if not token and token_file:
+            try:
+                token = Path(token_file).read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                raise RuntimeError("تعذر قراءة ملف BOT_TOKEN_FILE. تحقق من مسار ملف السر وصلاحياته.") from None
         chat_id = os.getenv("CHAT_ID", "").strip()
         if not token:
-            raise RuntimeError("BOT_TOKEN غير مضبوط. أضف توكن Telegram في متغيرات Render.")
+            raise RuntimeError("BOT_TOKEN غير مضبوط. أضف سر Telegram خارج المستودع عبر BOT_TOKEN أو BOT_TOKEN_FILE.")
         if not chat_id:
             raise RuntimeError("CHAT_ID غير مضبوط. أضف معرّف المحادثة في متغيرات Render.")
         return cls(
@@ -320,6 +326,7 @@ class SignalBot:
         self.m5: list[Bar] = []
         self.m15: list[Bar] = []
         self.last_data_warning = 0.0
+        self.last_heartbeat_save = 0.0
 
     def _price(self, value: float) -> str:
         return f"{value:,.{self.config.price_digits}f}"
@@ -509,6 +516,11 @@ class SignalBot:
                     self.last_data_warning = now
             except Exception as exc:
                 logging.error("خطأ غير متوقع (%s)، سيواصل البوت المحاولة.", type(exc).__name__)
+            heartbeat_interval = max(10.0, min(30.0, self.config.loop_seconds * 3))
+            if time.monotonic() - self.last_heartbeat_save >= heartbeat_interval:
+                self.state.data["last_heartbeat_epoch"] = time.time()
+                self.state.save()
+                self.last_heartbeat_save = time.monotonic()
             elapsed = time.monotonic() - started
             time.sleep(max(0.5, self.config.loop_seconds - elapsed))
 

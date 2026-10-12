@@ -1,10 +1,11 @@
 services:
-  - type: worker
+  - type: web
     name: xauusd-telegram-signals
     runtime: python
     plan: 0.5c-512mb
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python run_service.py
+    healthCheckPath: /healthz
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -26,5 +27,7 @@ services:
         value: "5"
       - key: CANDLE_REFRESH_SECONDS
         value: "20"
+      - key: WEB_WORKERS
+        value: "2"
       - key: STATE_FILE
         value: state.json
